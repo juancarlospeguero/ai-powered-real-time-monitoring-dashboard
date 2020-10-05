@@ -1,0 +1,112 @@
+# Alertmanager configuration for Elder incident management
+
+global:
+  resolve_timeout: 5m
+  # SMTP configuration for email alerts (configure via environment variables)
+  # smtp_smarthost: 'localhost:587'
+  # smtp_from: 'alerts@elder.local'
+  # smtp_auth_username: ''
+  # smtp_auth_password: ''
+  # smtp_require_tls: true
+
+# Alert routing configuration
+route:
+  # Default receiver for all alerts
+  receiver: 'default-receiver'
+
+  # Group alerts by cluster, alertname, service, and organization for on-call routing
+  group_by: ['cluster', 'alertname', 'severity', 'service', 'organization']
+
+  # Wait time before sending notification for a group
+  group_wait: 10s
+
+  # Wait time before sending notification about new alerts in existing group
+  group_interval: 10s
+
+  # Wait time before resending notification if alert is still firing
+  repeat_interval: 12h
+
+  # Routes for specific alert types
+  routes:
+    # On-call rotation alerts - route to on-call webhook for automatic assignment
+    - match_re:
+        service: '.+'
+      receiver: 'elder-oncall-webhook'
+      group_by: ['alertname', 'service', 'organization']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      continue: true
+
+    # Critical incidents - immediate notification
+    - match:
+        severity: critical
+      receiver: 'critical-incidents'
+      group_wait: 0s
+      repeat_interval: 5m
+      continue: true
+
+    # High priority incidents
+    - match:
+        severity: high
+      receiver: 'high-priority-incidents'
+      group_wait: 30s
+      repeat_interval: 1h
+      continue: true
+
+    # Elder application incidents from issues marked as incidents
+    - match:
+        alertname: ElderIncidentIssue
+      receiver: 'elder-incidents'
+      group_wait: 10s
+      repeat_interval: 30m
+
+# Inhibition rules - suppress certain alerts based on others
+inhibit_rules:
+  # Inhibit warning if critical is firing
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'cluster', 'service']
+
+# Alert receivers - notification destinations
+receivers:
+  # Default receiver - log only
+  - name: 'default-receiver'
+    webhook_configs:
+      - url: 'http://api:5000/api/v1/alerts/webhook'
+        send_resolved: true
+
+  # Critical incidents - webhook only (configure email/pagerduty per-OU via API)
+  - name: 'critical-incidents'
+    webhook_configs:
+      - url: 'http://api:5000/api/v1/alerts/webhook'
+        send_resolved: true
+    # Email configuration example (requires SMTP setup):
+    # email_configs:
+    #   - to: 'oncall@example.com'
+    #     headers:
+    #       Subject: '[CRITICAL] Elder Incident Alert'
+
+  # High priority incidents - webhook only
+  - name: 'high-priority-incidents'
+    webhook_configs:
+      - url: 'http://api:5000/api/v1/alerts/webhook'
+        send_resolved: true
+
+  # Elder application incidents from issues - webhook only
+  # Actual notification destinations are configured per-OU via /api/v1/organizations/{id}/alert-configs
+  - name: 'elder-incidents'
+    webhook_configs:
+      - url: 'http://api:5000/api/v1/alerts/webhook'
+        send_resolved: true
+
+  # On-call rotation webhook - routes alerts to current on-call person
+  # Matches alerts with 'service' or 'organization' labels to on-call rotations
+  # Automatically notifies current on-call person via configured channels (email, Slack, SMS)
+  - name: 'elder-oncall-webhook'
+    webhook_configs:
+      - url: 'http://api:5000/api/v1/on-call/alertmanager/webhook'
+        send_resolved: true
+        max_alerts: 0  # No limit on alerts per notification

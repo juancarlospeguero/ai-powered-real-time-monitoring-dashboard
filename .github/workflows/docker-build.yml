@@ -1,0 +1,227 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches: [ '**' ]  # All branches
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+# Required permissions for GHCR push, security scanning, and integration tests
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  K8S_NAMESPACE: ${{ secrets.K8S_NAMESPACE || 'elder' }}
+
+# ---------------------------------------------------------------------------
+# Build each platform in parallel, then merge into a multi-arch manifest.
+# Runs for every branch push and release tag.
+# ---------------------------------------------------------------------------
+jobs:
+  build-platform:
+    name: Build (${{ matrix.service.name }}, ${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - name: api
+            dockerfile: apps/api/Dockerfile
+            context: .
+          - name: web
+            dockerfile: web/Dockerfile
+            context: .
+          - name: scanner
+            dockerfile: apps/scanner/Dockerfile
+            context: apps/scanner
+          - name: worker
+            dockerfile: apps/worker/Dockerfile
+            context: .
+        platform:
+          - linux/amd64
+          - linux/arm64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+    - name: Set up QEMU (for arm64 emulation)
+      uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+    - name: Log in to Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Read version from .version file
+      id: version
+      run: |
+        VERSION=$(cat .version | tr -d '\n')
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Compute build epoch
+      id: epoch
+      run: echo "epoch=$(date +%s)" >> $GITHUB_OUTPUT
+
+    - name: Sanitize platform name for tag suffix
+      id: platform
+      env:
+        PLATFORM: ${{ matrix.platform }}
+      run: |
+        # linux/amd64 → amd64, linux/arm64 → arm64
+        echo "suffix=$(echo "$PLATFORM" | tr '/' '-' | cut -d'-' -f2-)" >> $GITHUB_OUTPUT
+
+    - name: Build and push platform image
+      id: build
+      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+      with:
+        context: ${{ matrix.service.context }}
+        file: ${{ matrix.service.dockerfile }}
+        platforms: ${{ matrix.platform }}
+        push: ${{ github.event_name != 'pull_request' }}
+        # Push to a platform-specific tag; merged in the next job
+        tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/elder-${{ matrix.service.name }}:${{ steps.version.outputs.version }}-${{ steps.platform.outputs.suffix }}
+        # Scope cache per service+platform to prevent eviction
+        cache-from: type=gha,scope=${{ matrix.service.name }}-${{ steps.platform.outputs.suffix }}
+        cache-to: type=gha,mode=max,scope=${{ matrix.service.name }}-${{ steps.platform.outputs.suffix }}
+        provenance: false
+        sbom: false
+        build-args: |
+          VCS_REF=${{ github.sha }}
+          VERSION=${{ steps.version.outputs.version }}
+          APP_VERSION=${{ steps.version.outputs.version }}
+          VITE_VERSION=${{ steps.version.outputs.version }}
+          VITE_BUILD_TIME=${{ steps.epoch.outputs.epoch }}
+          GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+
+  merge-manifests:
+    name: Merge manifest (${{ matrix.service }})
+    needs: build-platform
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api, web, scanner, worker]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Read version from .version file
+      id: version
+      run: |
+        VERSION=$(cat .version | tr -d '\n')
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Merge platform images into multi-arch manifest
+      env:
+        SERVICE: ${{ matrix.service }}
+        VERSION: ${{ steps.version.outputs.version }}
+        IS_RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        IS_MAIN: ${{ github.ref == 'refs/heads/main' }}
+        IS_RELEASE_BRANCH: ${{ startsWith(github.ref, 'refs/heads/v') }}
+        REF_NAME: ${{ github.ref_name }}
+        REGISTRY: ${{ env.REGISTRY }}
+        ORG: ${{ github.repository_owner }}
+      run: |
+        IMAGE="${REGISTRY}/${ORG}/elder-${SERVICE}"
+        SRC_AMD64="${IMAGE}:${VERSION}-amd64"
+        SRC_ARM64="${IMAGE}:${VERSION}-arm64"
+
+        # Determine which named tags to create for this ref
+        TAGS=()
+        if [ "$IS_RELEASE_TAG" = "true" ]; then
+          TAGS+=("${IMAGE}:${VERSION}" "${IMAGE}:${REF_NAME}" "${IMAGE}:latest")
+        elif [ "$IS_MAIN" = "true" ]; then
+          TAGS+=("${IMAGE}:${VERSION}-gamma")
+        elif [ "$IS_RELEASE_BRANCH" = "true" ]; then
+          TAGS+=("${IMAGE}:${VERSION}-beta")
+        else
+          TAGS+=("${IMAGE}:${VERSION}-alpha")
+        fi
+
+        # Build the --tag args list
+        TAG_ARGS=()
+        for tag in "${TAGS[@]}"; do
+          TAG_ARGS+=(--tag "$tag")
+        done
+
+        docker buildx imagetools create "${TAG_ARGS[@]}" "$SRC_AMD64" "$SRC_ARM64"
+
+        echo "Merged multi-arch manifest for elder-${SERVICE} → ${TAGS[*]}"
+        docker buildx imagetools inspect "${TAGS[0]}"
+
+  # Release creation (triggered after manifests are merged)
+  release:
+    needs: merge-manifests
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      with:
+        fetch-depth: 0
+
+    - name: Generate changelog
+      run: |
+        echo "## What's Changed" > CHANGELOG.md
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+        if [ -n "$PREVIOUS_TAG" ]; then
+          echo "### Features" >> CHANGELOG.md
+          git log --pretty=format:"* %s (%h)" "$PREVIOUS_TAG"..HEAD --grep="feat:" --grep="feature:" >> CHANGELOG.md || true
+          echo "" >> CHANGELOG.md
+          echo "### Bug Fixes" >> CHANGELOG.md
+          git log --pretty=format:"* %s (%h)" "$PREVIOUS_TAG"..HEAD --grep="fix:" --grep="bug:" >> CHANGELOG.md || true
+          echo "" >> CHANGELOG.md
+          echo "### Other Changes" >> CHANGELOG.md
+          git log --pretty=format:"* %s (%h)" "$PREVIOUS_TAG"..HEAD \
+            --invert-grep --grep="feat:" --grep="feature:" --grep="fix:" --grep="bug:" >> CHANGELOG.md || true
+        else
+          git log --pretty=format:"* %s (%h)" >> CHANGELOG.md
+        fi
+        echo "" >> CHANGELOG.md
+        echo "### Docker Images" >> CHANGELOG.md
+        echo "- \`${{ env.REGISTRY }}/${{ github.repository_owner }}/elder-api:${GITHUB_REF_NAME}\`" >> CHANGELOG.md
+        echo "- \`${{ env.REGISTRY }}/${{ github.repository_owner }}/elder-web:${GITHUB_REF_NAME}\`" >> CHANGELOG.md
+
+    - name: Create Release
+      uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e  # v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        release_name: Release ${{ github.ref_name }}
+        body_path: CHANGELOG.md
+        draft: false
+        prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+
+  # Security scanning disabled — handled in ci.yml filesystem scan
+  security-scan:
+    needs: build-platform
+    runs-on: ubuntu-latest
+    if: false
+    strategy:
+      matrix:
+        service: [api, web, scanner, worker]
+    steps:
+    - run: echo "Container security scan disabled — see ci.yml for filesystem scan"

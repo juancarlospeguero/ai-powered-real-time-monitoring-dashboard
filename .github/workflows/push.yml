@@ -1,0 +1,32 @@
+# DEPRECATED: This workflow is superseded by docker-build.yml
+# Keeping file for reference but disabled to prevent conflicts
+
+name: Publish Docker image on push (DISABLED)
+
+on:
+  workflow_dispatch:  # Only allow manual trigger, effectively disabling it
+    inputs:
+      reason:
+        description: 'Reason for manual trigger (this workflow is deprecated)'
+        required: true
+
+# This workflow was part of an old template. Use docker-build.yml instead which:
+# - Builds multi-arch images (amd64/arm64)
+# - Pushes to GHCR
+# - Runs security scans
+# - Runs integration tests
+# - Has proper caching
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notice
+        run: |
+          echo "This workflow is deprecated. Please use docker-build.yml instead."
+          echo "The docker-build.yml workflow handles:"
+          echo "  - Multi-arch builds (amd64/arm64)"
+          echo "  - GHCR registry push"
+          echo "  - Security scanning"
+          echo "  - Integration testing"
+          exit 0
