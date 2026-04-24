@@ -1,7 +1,7 @@
 # AI-Powered Real-Time Monitoring Dashboard
 
 ## Overview
-Real-time monitoring dashboard built at América Móvil. AI-powered log analysis with AWS Bedrock.
+Real-time monitoring dashboard built at Idelji. AI-powered log analysis with AWS Bedrock.
 
 ## Tech Stack
 - Backend: FastAPI, Python, WebSocket
